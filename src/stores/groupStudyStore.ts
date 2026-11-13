@@ -12,18 +12,18 @@ export interface Participant {
   appType: AppType;
   status: ParticipantStatus;
   remainingSeconds: number;
-  isSynced: boolean;
-  avatarColor?: string;
+  endTime?: number | null;
   isRunning?: boolean;
   mode?: 'focus' | 'break';
-  endTime?: number;
+  isSynced: boolean;
+  avatarColor?: string;
   syncMode?: SyncMode; // backwards compat
 }
 
 export interface TimerSyncPayload {
   isRunning: boolean;
   mode: 'focus' | 'break';
-  endTime: number;
+  endTime: number | null;
   remainingSeconds: number;
   updatedBy: string; // sessionTabId
   action?: 'START' | 'PAUSE' | 'RESET' | 'MODE_CHANGE';
@@ -79,6 +79,17 @@ function getInitialUsername(): string {
   return 'CozyScholar';
 }
 
+function getInitialIsJoined(): boolean {
+  if (typeof window !== 'undefined') {
+    try {
+      return sessionStorage.getItem('vg_study_joined') === 'true';
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
 // Generate unique sessionTabId per browser tab stored in sessionStorage
 export const sessionTabId =
   typeof window !== 'undefined'
@@ -95,18 +106,43 @@ export const sessionTabId =
     : 'server_tab';
 
 export const localParticipantId = sessionTabId; // Alias for compatibility
+export const tabId = sessionTabId; // Unified tab identifier
+
+export interface LocalTimerState {
+  isRunning: boolean;
+  mode: 'focus' | 'break';
+  remainingSeconds: number;
+  endTime: number | null;
+}
+
+export const localTimerStateStore = atom<LocalTimerState>({
+  isRunning: false,
+  mode: 'focus',
+  remainingSeconds: 25 * 60,
+  endTime: null,
+});
 
 export const roomCodeStore = atom<string>(getInitialRoom());
 export const usernameStore = atom<string>(getInitialUsername());
-export const isConnectedStore = atom<boolean>(false);
+export const isJoinedStore = atom<boolean>(getInitialIsJoined());
+export const isConnectedStore = isJoinedStore; // Alias for backward compatibility
 export const isConnectingStore = atom<boolean>(false);
 export const connectionErrorStore = atom<string | null>(null);
-export const channelStatusStore = atom<'DISCONNECTED' | 'CONNECTING' | 'SUBSCRIBED' | 'CHANNEL_ERROR' | 'TIMED_OUT' | 'CLOSED'>('DISCONNECTED');
+export const channelStatusStore = atom<'online' | 'connecting' | 'reconnecting' | 'offline' | 'SUBSCRIBED' | 'CONNECTING' | 'CHANNEL_ERROR' | 'TIMED_OUT' | 'CLOSED'>('offline');
 export const syncModeStore = atom<SyncMode>('synced');
 export const participantsStore = atom<Participant[]>([]);
 export const incomingTimerSyncStore = atom<TimerSyncPayload | null>(null);
 
-let activeChannel: RealtimeChannel | null = null;
+let activeChannelInstance: RealtimeChannel | null = null;
+
+export function setChannelInstance(channel: RealtimeChannel | null) {
+  activeChannelInstance = channel;
+}
+
+export function getChannelInstance(): RealtimeChannel | null {
+  return activeChannelInstance;
+}
+
 let currentLocalPresence: Participant = {
   id: sessionTabId,
   username: getInitialUsername(),
@@ -114,6 +150,9 @@ let currentLocalPresence: Participant = {
   avatarColor: getAvatarColor(getInitialUsername()),
   status: 'Idle',
   remainingSeconds: 25 * 60,
+  endTime: null,
+  isRunning: false,
+  mode: 'focus',
   isSynced: true,
   syncMode: 'synced',
 };
@@ -124,19 +163,23 @@ export function registerLocalStateSupplier(supplier: () => TimerSyncPayload | nu
   localStateSupplier = supplier;
 }
 
-export function setSyncMode(mode: SyncMode) {
-  syncModeStore.set(mode);
-  currentLocalPresence.syncMode = mode;
-  currentLocalPresence.isSynced = mode === 'synced';
-  if (activeChannel && channelStatusStore.get() === 'SUBSCRIBED') {
-    activeChannel.track(currentLocalPresence);
+export function getLocalPresence(): Participant {
+  if (localStateSupplier) {
+    const state = localStateSupplier();
+    if (state) {
+      currentLocalPresence.isRunning = state.isRunning;
+      currentLocalPresence.mode = state.mode;
+      currentLocalPresence.remainingSeconds = state.remainingSeconds;
+      currentLocalPresence.endTime = state.endTime;
+      currentLocalPresence.status = state.isRunning
+        ? state.mode === 'focus'
+          ? 'Focusing'
+          : 'Break'
+        : 'Idle';
+    }
   }
-}
-
-export function updateLocalPresence(data: Partial<Participant>) {
-  currentLocalPresence = {
+  return {
     ...currentLocalPresence,
-    ...data,
     id: sessionTabId,
     username: usernameStore.get(),
     appType: 'patio',
@@ -144,15 +187,126 @@ export function updateLocalPresence(data: Partial<Participant>) {
     isSynced: syncModeStore.get() === 'synced',
     syncMode: syncModeStore.get(),
   };
+}
 
-  if (activeChannel && channelStatusStore.get() === 'SUBSCRIBED') {
-    activeChannel.track(currentLocalPresence).catch((e) => {
+export function setSyncMode(mode: SyncMode) {
+  syncModeStore.set(mode);
+  const isSynced = mode === 'synced';
+  currentLocalPresence.syncMode = mode;
+  currentLocalPresence.isSynced = isSynced;
+
+  if (activeChannelInstance && (channelStatusStore.get() === 'online' || channelStatusStore.get() === 'SUBSCRIBED')) {
+    activeChannelInstance.track(getLocalPresence()).catch((e) => {
+      console.warn('Presence track error:', e);
+    });
+  }
+
+  // Instant catch-up when switching to 'synced'
+  if (isSynced) {
+    performCatchup();
+  }
+}
+
+export function updateLocalPresence(data: Partial<Participant>) {
+  const isSynced = syncModeStore.get() === 'synced';
+  currentLocalPresence = {
+    ...currentLocalPresence,
+    ...data,
+    id: sessionTabId,
+    username: usernameStore.get(),
+    appType: 'patio',
+    avatarColor: getAvatarColor(usernameStore.get()),
+    isSynced,
+    syncMode: syncModeStore.get(),
+  };
+
+  // Keep local participant in participantsStore up-to-date instantly
+  const currentList = participantsStore.get();
+  const selfIdx = currentList.findIndex((p) => p.id === sessionTabId);
+  if (selfIdx >= 0) {
+    const updated = [...currentList];
+    updated[selfIdx] = { ...updated[selfIdx], ...currentLocalPresence };
+    participantsStore.set(updated);
+  } else if (isJoinedStore.get()) {
+    participantsStore.set([{ ...currentLocalPresence }, ...currentList]);
+  }
+
+  // Track over network on meaningful changes
+  if (activeChannelInstance && (channelStatusStore.get() === 'online' || channelStatusStore.get() === 'SUBSCRIBED')) {
+    activeChannelInstance.track(currentLocalPresence).catch((e) => {
       console.warn('Presence track error:', e);
     });
   }
 }
 
-export async function joinRoom(roomCode: string, username: string): Promise<boolean> {
+export function performCatchup(customList?: Participant[]) {
+  if (syncModeStore.get() !== 'synced') return;
+
+  const list = customList || participantsStore.get();
+  if (!list || list.length === 0) return;
+
+  const now = Date.now();
+  // Filter for other online members where member.isSynced === true
+  const syncedBuddies = list.filter((m) => {
+    if (m.id === sessionTabId) return false;
+    return m.isSynced === true || (m.isSynced as any) === 'true' || m.syncMode === 'synced';
+  });
+
+  if (syncedBuddies.length === 0) return;
+
+  // 1. If any synced member currently has member.isRunning === true and member.endTime > Date.now()
+  const activeRunningBuddy = syncedBuddies.find((m) => {
+    const isBuddyRunning = m.isRunning === true || (m.isRunning as any) === 'true' || m.status === 'Focusing' || m.status === 'Break';
+    const targetEnd = m.endTime ? Number(m.endTime) : (isBuddyRunning && m.remainingSeconds ? now + m.remainingSeconds * 1000 : 0);
+    return isBuddyRunning && targetEnd > now;
+  });
+
+  if (activeRunningBuddy) {
+    const targetEnd = activeRunningBuddy.endTime ? Number(activeRunningBuddy.endTime) : (now + activeRunningBuddy.remainingSeconds * 1000);
+    const remaining = Math.max(0, Math.ceil((targetEnd - now) / 1000));
+    const mode = (activeRunningBuddy.mode || (activeRunningBuddy.status === 'Break' ? 'break' : 'focus')) as 'focus' | 'break';
+
+    // Check if we are already locally running the exact same countdown
+    const localState = localStateSupplier ? localStateSupplier() : null;
+    if (localState?.isRunning && localState.endTime && Math.abs(localState.endTime - targetEnd) < 2000 && localState.mode === mode) {
+      return; // Already in sync!
+    }
+
+    incomingTimerSyncStore.set({
+      isRunning: true,
+      mode,
+      endTime: targetEnd,
+      remainingSeconds: remaining,
+      updatedBy: activeRunningBuddy.id,
+      action: 'START',
+    });
+  } else {
+    // 2. If no synced member is running, adopt their paused remainingSeconds and mode
+    const pausedBuddy = syncedBuddies[0];
+    if (pausedBuddy) {
+      const mode = (pausedBuddy.mode || (pausedBuddy.status === 'Break' ? 'break' : 'focus')) as 'focus' | 'break';
+      const remaining = typeof pausedBuddy.remainingSeconds === 'number'
+        ? pausedBuddy.remainingSeconds
+        : Number(pausedBuddy.remainingSeconds) || (mode === 'focus' ? 25 * 60 : 5 * 60);
+
+      const localState = localStateSupplier ? localStateSupplier() : null;
+      if (!localState?.isRunning && localState?.remainingSeconds === remaining && localState?.mode === mode) {
+        return; // Already in sync!
+      }
+
+      incomingTimerSyncStore.set({
+        isRunning: false,
+        mode,
+        endTime: null,
+        remainingSeconds: remaining,
+        updatedBy: pausedBuddy.id,
+        action: 'PAUSE',
+      });
+    }
+  }
+}
+
+export function joinRoom(roomCode: string, username: string): boolean {
   const cleanRoom = roomCode.trim().toLowerCase().replace(/^#/, '') || 'study-lounge';
   const cleanUser = username.trim() || 'CozyScholar';
 
@@ -163,187 +317,46 @@ export async function joinRoom(roomCode: string, username: string): Promise<bool
     try {
       localStorage.setItem('vg_study_room', cleanRoom);
       localStorage.setItem('vg_study_username', cleanUser);
+      sessionStorage.setItem('vg_study_joined', 'true');
     } catch {}
   }
 
-  if (!isSupabaseConfigured || !supabase) {
-    channelStatusStore.set('CHANNEL_ERROR');
-    connectionErrorStore.set('Offline / Check .env');
-    return false;
-  }
-
-  isConnectingStore.set(true);
-  channelStatusStore.set('CONNECTING');
-  connectionErrorStore.set(null);
-
-  // Leave any existing channel
-  if (activeChannel) {
-    try {
-      await supabase.removeChannel(activeChannel);
-    } catch {}
-    activeChannel = null;
-  }
-
-  try {
-    // Exact Unified Channel Name: cozy-study-room:${cleanRoom}
-    const channelName = `cozy-study-room:${cleanRoom}`;
-    const channel = supabase.channel(channelName, {
-      config: {
-        presence: {
-          key: sessionTabId,
-        },
-        broadcast: {
-          self: false,
-        },
-      },
-    });
-
-    // 1. Presence Sync
-    channel.on('presence', { event: 'sync' }, () => {
-      const state = channel.presenceState();
-      const list: Participant[] = [];
-      Object.keys(state).forEach((key) => {
-        const presences = state[key] as any[];
-        if (presences && presences.length > 0) {
-          const item = presences[presences.length - 1];
-          list.push({
-            ...item,
-            id: item.id || key,
-            isSynced: item.isSynced ?? (item.syncMode === 'synced'),
-            appType: item.appType || 'window',
-            status: item.status || 'Idle',
-          });
-        }
-      });
-      participantsStore.set(list);
-
-      // Late-joiner sync: If local user is synced, adopt any active running timer from the room
-      if (syncModeStore.get() === 'synced') {
-        const now = Date.now();
-        const activeRunningBuddy = list.find((m) => {
-          if (m.id === sessionTabId) return false;
-          const isBuddySynced = m.isSynced ?? (m.syncMode === 'synced');
-          const isBuddyRunning = m.isRunning || m.status === 'Focusing';
-          const endTime = m.endTime || (m.remainingSeconds ? now + m.remainingSeconds * 1000 : 0);
-          return isBuddySynced && isBuddyRunning && endTime > now;
-        });
-
-        if (activeRunningBuddy) {
-          const targetEnd = activeRunningBuddy.endTime || (now + activeRunningBuddy.remainingSeconds * 1000);
-          const remaining = Math.max(0, Math.ceil((targetEnd - now) / 1000));
-          incomingTimerSyncStore.set({
-            isRunning: true,
-            mode: (activeRunningBuddy.mode || (activeRunningBuddy.status === 'Break' ? 'break' : 'focus')) as 'focus' | 'break',
-            endTime: targetEnd,
-            remainingSeconds: remaining,
-            updatedBy: activeRunningBuddy.id,
-            action: 'START',
-          });
-        }
-      }
-    });
-
-    // 2. Broadcast: Timer Sync ('timer_sync')
-    channel.on('broadcast', { event: 'timer_sync' }, ({ payload }) => {
-      if (payload && payload.updatedBy !== sessionTabId) {
-        if (syncModeStore.get() === 'synced') {
-          incomingTimerSyncStore.set(payload as TimerSyncPayload);
-        }
-      }
-    });
-
-    // 3. Broadcast: Request State
-    channel.on('broadcast', { event: 'request_state' }, ({ payload }) => {
-      if (payload && payload.updatedBy !== sessionTabId && localStateSupplier) {
-        const state = localStateSupplier();
-        if (state && channel) {
-          channel.send({
-            type: 'broadcast',
-            event: 'timer_sync',
-            payload: state,
-          });
-        }
-      }
-    });
-
-    // Real Channel Status Subscription
-    const subscribedPromise = new Promise<string>((resolve) => {
-      channel.subscribe((status) => {
-        if (status === 'SUBSCRIBED') {
-          channelStatusStore.set('SUBSCRIBED');
-          isConnectedStore.set(true);
-          isConnectingStore.set(false);
-          connectionErrorStore.set(null);
-          resolve('SUBSCRIBED');
-        } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
-          channelStatusStore.set(status as any);
-          isConnectedStore.set(false);
-          isConnectingStore.set(false);
-          connectionErrorStore.set('Offline / Check .env');
-          resolve(status);
-        }
-      });
-    });
-
-    const statusResult = await subscribedPromise;
-
-    if (statusResult === 'SUBSCRIBED') {
-      activeChannel = channel;
-
-      // Track presence with unified schema
-      currentLocalPresence.username = cleanUser;
-      currentLocalPresence.avatarColor = getAvatarColor(cleanUser);
-      currentLocalPresence.isSynced = syncModeStore.get() === 'synced';
-      currentLocalPresence.syncMode = syncModeStore.get();
-      await channel.track(currentLocalPresence);
-
-      // Emit request_state for immediate sync catchup
-      channel.send({
-        type: 'broadcast',
-        event: 'request_state',
-        payload: {
-          updatedBy: sessionTabId,
-          timestamp: Date.now(),
-        },
-      });
-
-      return true;
-    } else {
-      return false;
-    }
-  } catch (err: any) {
-    isConnectingStore.set(false);
-    channelStatusStore.set('CHANNEL_ERROR');
-    connectionErrorStore.set('Offline / Check .env');
-    return false;
-  }
+  isJoinedStore.set(true);
+  return true;
 }
 
 export async function leaveRoom(): Promise<void> {
-  if (activeChannel && supabase) {
+  if (typeof window !== 'undefined') {
     try {
-      await activeChannel.untrack();
-      await supabase.removeChannel(activeChannel);
+      sessionStorage.removeItem('vg_study_joined');
     } catch {}
-    activeChannel = null;
   }
-  channelStatusStore.set('DISCONNECTED');
-  isConnectedStore.set(false);
-  isConnectingStore.set(false);
+  isJoinedStore.set(false);
+  channelStatusStore.set('offline');
   participantsStore.set([]);
   connectionErrorStore.set(null);
+
+  if (activeChannelInstance) {
+    try {
+      await activeChannelInstance.untrack();
+      if (supabase) {
+        await supabase.removeChannel(activeChannelInstance);
+      }
+    } catch {}
+    activeChannelInstance = null;
+  }
 }
 
 export function broadcastTimerAction(
   action: 'START' | 'PAUSE' | 'RESET' | 'MODE_CHANGE',
   mode: 'focus' | 'break',
   remainingSeconds: number,
-  endTime?: number
+  endTime?: number | null
 ) {
-  if (!activeChannel || channelStatusStore.get() !== 'SUBSCRIBED' || syncModeStore.get() !== 'synced') return;
+  if (!activeChannelInstance || syncModeStore.get() !== 'synced') return;
 
   const isRunning = action === 'START';
-  const targetEndTime = endTime || (isRunning ? Date.now() + remainingSeconds * 1000 : 0);
+  const targetEndTime = isRunning ? (endTime || Date.now() + remainingSeconds * 1000) : null;
   const payload: TimerSyncPayload = {
     isRunning,
     mode,
@@ -353,7 +366,7 @@ export function broadcastTimerAction(
     action,
   };
 
-  activeChannel.send({
+  activeChannelInstance.send({
     type: 'broadcast',
     event: 'timer_sync',
     payload,

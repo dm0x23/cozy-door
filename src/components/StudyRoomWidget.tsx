@@ -5,21 +5,16 @@ import {
   widgetMinimizedStore,
 } from '../stores/appStore';
 import {
-  roomCodeStore,
-  usernameStore,
-  isConnectedStore,
   isConnectingStore,
   connectionErrorStore,
-  syncModeStore,
-  participantsStore,
   localParticipantId,
   joinRoom,
   leaveRoom,
   setSyncMode,
-  type SyncMode,
 } from '../stores/groupStudyStore';
 import { isSupabaseConfigured } from '../lib/supabase';
 import { useDraggable } from '../hooks/useDraggable';
+import { useStudyRoom } from '../hooks/useStudyRoom';
 import {
   Users,
   ChevronDown,
@@ -36,18 +31,44 @@ import {
 export const StudyRoomWidget: React.FC = () => {
   const zenMode = useStore(zenModeStore);
   const minimized = useStore(widgetMinimizedStore);
-  const roomCode = useStore(roomCodeStore);
-  const username = useStore(usernameStore);
-  const isConnected = useStore(isConnectedStore);
   const isConnecting = useStore(isConnectingStore);
   const connectionError = useStore(connectionErrorStore);
-  const syncMode = useStore(syncModeStore);
-  const participants = useStore(participantsStore);
+
+  // Single rock-solid hook managing channel lifecycle, presence, sync, and auto-reconnect
+  const {
+    isJoined,
+    roomCode,
+    username,
+    syncMode,
+    isSynced,
+    participants,
+    channelStatus,
+    tabId,
+  } = useStudyRoom();
+
+  const isConnected = isJoined;
 
   const [inputUsername, setInputUsername] = useState(username);
   const [inputRoomCode, setInputRoomCode] = useState(roomCode);
   const [copied, setCopied] = useState(false);
   const [isOpen, setIsOpen] = useState(false); // Popover open state when disconnected
+
+  // 1-second interval to keep live countdowns synchronized on UI
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const interval = setInterval(() => setTick((t) => (t + 1) % 1000), 1000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const getDisplayRemainingSeconds = (member: (typeof participants)[0]) => {
+    const isRunning = Boolean(
+      member.isRunning || member.status === 'Focusing' || member.status === 'Break'
+    );
+    if (isRunning && member.endTime) {
+      return Math.max(0, Math.ceil((member.endTime - Date.now()) / 1000));
+    }
+    return member.remainingSeconds || 0;
+  };
 
   const { position, dragHandleProps } = useDraggable('studyRoom', () => ({
     x: typeof window !== 'undefined' ? Math.max(16, window.innerWidth / 2 + 160) : 600,
@@ -74,7 +95,7 @@ export const StudyRoomWidget: React.FC = () => {
 
   const handleJoin = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    const success = await joinRoom(inputRoomCode, inputUsername);
+    const success = joinRoom(inputRoomCode, inputUsername);
     if (success) {
       setIsOpen(false);
     }
@@ -240,7 +261,35 @@ export const StudyRoomWidget: React.FC = () => {
               <span className="text-xs font-semibold text-slate-100 truncate">
                 #{roomCode}
               </span>
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse flex-shrink-0" />
+              {channelStatus === 'SUBSCRIBED' || channelStatus === 'online' ? (
+                <div className="flex items-center space-x-1 pl-1">
+                  <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse flex-shrink-0" />
+                  <span className="text-[10px] text-emerald-300 font-medium">
+                    {participants.length} online
+                  </span>
+                </div>
+              ) : channelStatus === 'reconnecting' ? (
+                <div className="flex items-center space-x-1 pl-1">
+                  <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse flex-shrink-0" />
+                  <span className="text-[10px] text-amber-300 font-medium">
+                    Reconnecting...
+                  </span>
+                </div>
+              ) : channelStatus === 'connecting' || channelStatus === 'CONNECTING' ? (
+                <div className="flex items-center space-x-1 pl-1">
+                  <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse flex-shrink-0" />
+                  <span className="text-[10px] text-amber-300 font-medium">
+                    Connecting...
+                  </span>
+                </div>
+              ) : (
+                <div className="flex items-center space-x-1 pl-1">
+                  <span className="w-2 h-2 rounded-full bg-rose-400 flex-shrink-0" />
+                  <span className="text-[10px] text-rose-300 font-medium">
+                    Offline
+                  </span>
+                </div>
+              )}
             </div>
 
             <div className="flex items-center space-x-1 flex-shrink-0">
@@ -287,21 +336,19 @@ export const StudyRoomWidget: React.FC = () => {
                 <div className="flex p-0.5 bg-[#16171b] rounded-lg border border-white/5 text-xs">
                   <button
                     onClick={() => setSyncMode('synced')}
-                    className={`flex-1 py-1 rounded-md text-[11px] font-medium transition-all ${
-                      syncMode === 'synced'
+                    className={`flex-1 py-1 rounded-md text-[11px] font-medium transition-all ${syncMode === 'synced'
                         ? 'bg-[#8EA2FF]/20 text-[#B8C4FF] border border-[#8EA2FF]/40 shadow-sm'
                         : 'text-slate-400 hover:text-slate-200'
-                    }`}
+                      }`}
                   >
                     Synced
                   </button>
                   <button
                     onClick={() => setSyncMode('unsynced')}
-                    className={`flex-1 py-1 rounded-md text-[11px] font-medium transition-all ${
-                      syncMode === 'unsynced'
+                    className={`flex-1 py-1 rounded-md text-[11px] font-medium transition-all ${syncMode === 'unsynced'
                         ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40 shadow-sm'
                         : 'text-slate-400 hover:text-slate-200'
-                    }`}
+                      }`}
                   >
                     Unsynced
                   </button>
@@ -316,20 +363,21 @@ export const StudyRoomWidget: React.FC = () => {
 
                 <div className="max-h-48 overflow-y-auto space-y-1.5 pr-0.5">
                   {participants.map((member) => {
-                    const isSelf = member.id === localParticipantId;
-                    const isFocusing = member.status === 'focusing';
-                    const isBreak = member.status === 'break';
+                    const isSelf = member.id === tabId || member.id === localParticipantId;
+                    const isFocusing = member.status === 'Focusing' || member.status === 'focusing' || (member.isRunning && member.mode === 'focus');
+                    const isBreak = member.status === 'Break' || member.status === 'break' || (member.isRunning && member.mode === 'break');
+                    const isSynced = member.isSynced === true || (member.isSynced as any) === 'true' || member.syncMode === 'synced';
+                    const remainingSec = getDisplayRemainingSeconds(member);
 
                     return (
                       <div
                         key={member.id}
-                        className={`p-2 rounded-xl border flex items-center justify-between transition-colors ${
-                          isSelf
+                        className={`p-2 rounded-xl border flex items-center justify-between transition-colors ${isSelf
                             ? 'bg-[#25272E]/90 border-[#8EA2FF]/30'
                             : 'bg-[#22242b] border-white/5'
-                        }`}
+                          }`}
                       >
-                        {/* Member Identity: Avatar initial + Name */}
+                        {/* Member Identity: Avatar initial + Name + AppType badge */}
                         <div className="flex items-center space-x-2 min-w-0">
                           <div
                             className="w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold text-slate-900 flex-shrink-0 shadow-sm"
@@ -339,12 +387,15 @@ export const StudyRoomWidget: React.FC = () => {
                           </div>
                           <div className="min-w-0">
                             <div className="text-xs font-medium text-slate-200 truncate flex items-center space-x-1">
-                              <span>{member.username}</span>
+                              <span className="truncate">{member.username}</span>
                               {isSelf && (
-                                <span className="text-[9px] text-[#8EA2FF] font-semibold">
+                                <span className="text-[9px] text-[#8EA2FF] font-semibold flex-shrink-0">
                                   (You)
                                 </span>
                               )}
+                              <span className="text-[9px] px-1 py-0.2 rounded bg-white/5 text-slate-400 uppercase font-mono flex-shrink-0">
+                                {member.appType === 'patio' ? 'Patio' : 'Window'}
+                              </span>
                             </div>
                           </div>
                         </div>
@@ -353,32 +404,30 @@ export const StudyRoomWidget: React.FC = () => {
                         <div className="flex items-center space-x-1.5 flex-shrink-0">
                           {/* Status Badge */}
                           <div
-                            className={`px-2 py-0.5 rounded-full text-[10px] font-mono font-medium flex items-center space-x-1 ${
-                              isFocusing
+                            className={`px-2 py-0.5 rounded-full text-[10px] font-mono font-medium flex items-center space-x-1 ${isFocusing
                                 ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/30'
                                 : isBreak
-                                ? 'bg-cyan-500/15 text-cyan-300 border border-cyan-500/30'
-                                : 'bg-slate-700/30 text-slate-400 border border-slate-700/40'
-                            }`}
+                                  ? 'bg-cyan-500/15 text-cyan-300 border border-cyan-500/30'
+                                  : 'bg-slate-700/30 text-slate-400 border border-slate-700/40'
+                              }`}
                           >
                             <span>
                               {isFocusing
-                                ? `Focus ${formatSeconds(member.remainingSeconds)}`
+                                ? `Focus ${formatSeconds(remainingSec)}`
                                 : isBreak
-                                ? `Break ${formatSeconds(member.remainingSeconds)}`
-                                : 'Idle'}
+                                  ? `Break ${formatSeconds(remainingSec)}`
+                                  : 'Idle'}
                             </span>
                           </div>
 
                           {/* Synced vs. Solo Tag */}
                           <span
-                            className={`text-[9px] px-1.5 py-0.5 rounded font-medium ${
-                              member.syncMode === 'synced'
+                            className={`text-[9px] px-1.5 py-0.5 rounded font-medium ${isSynced
                                 ? 'bg-[#8EA2FF]/20 text-[#B8C4FF]'
                                 : 'bg-amber-500/15 text-amber-300'
-                            }`}
+                              }`}
                           >
-                            {member.syncMode === 'synced' ? 'Synced' : 'Solo'}
+                            {isSynced ? 'Synced' : 'Solo'}
                           </span>
                         </div>
                       </div>

@@ -13,6 +13,7 @@ import {
   localParticipantId,
   updateLocalPresence,
   registerLocalStateSupplier,
+  localTimerStateStore,
 } from '../stores/groupStudyStore';
 import { useDraggable } from '../hooks/useDraggable';
 import { audioEngine } from '../utils/audio';
@@ -62,8 +63,12 @@ export const PomodoroWidget: React.FC = () => {
         } else if (action === 'PAUSE') {
           if (timerId) clearInterval(timerId);
           timerId = null;
-          const now = Date.now();
-          remaining = Math.max(0, Math.ceil((targetTime - now) / 1000));
+          if (payload && typeof payload.duration === 'number') {
+            remaining = payload.duration;
+          } else if (targetTime > 0) {
+            const now = Date.now();
+            remaining = Math.max(0, Math.ceil((targetTime - now) / 1000));
+          }
           self.postMessage({ type: 'PAUSED', timeLeft: remaining });
         } else if (action === 'RESUME') {
           targetTime = Date.now() + remaining * 1000;
@@ -81,7 +86,7 @@ export const PomodoroWidget: React.FC = () => {
         } else if (action === 'RESET') {
           if (timerId) clearInterval(timerId);
           timerId = null;
-          remaining = payload.duration;
+          remaining = payload ? payload.duration : 0;
           self.postMessage({ type: 'RESET', timeLeft: remaining });
         } else if (action === 'SYNC') {
           if (timerId) {
@@ -148,70 +153,73 @@ export const PomodoroWidget: React.FC = () => {
     };
   }, [isRunning]);
 
+  // Keep shared local timer state store up-to-date for useStudyRoom hook
+  useEffect(() => {
+    localTimerStateStore.set({
+      isRunning,
+      mode,
+      remainingSeconds: timeLeft,
+      endTime: isRunning ? Date.now() + timeLeft * 1000 : null,
+    });
+  }, [isRunning, mode, timeLeft]);
+
   // Register local state supplier for late-joiners in study room
   useEffect(() => {
     registerLocalStateSupplier(() => {
-      if (!isRunning) return null;
       return {
         updatedBy: sessionTabId,
-        action: 'START',
-        isRunning: true,
+        action: isRunning ? 'START' : 'PAUSE',
+        isRunning,
         mode,
-        endTime: Date.now() + timeLeft * 1000,
+        endTime: isRunning ? Date.now() + timeLeft * 1000 : null,
         remainingSeconds: timeLeft,
       };
     });
   }, [isRunning, mode, timeLeft]);
 
-  // Sync local presence to room members
+  // Sync local presence to room members on meaningful state transitions (start, pause, mode, syncMode)
   useEffect(() => {
+    const isSynced = syncMode === 'synced';
+    const currentEndTime = isRunning ? Date.now() + timeLeft * 1000 : null;
     updateLocalPresence({
       status: isRunning ? (mode === 'focus' ? 'Focusing' : 'Break') : 'Idle',
       remainingSeconds: timeLeft,
-      isSynced: syncMode === 'synced',
+      endTime: currentEndTime,
       isRunning,
       mode,
-      endTime: isRunning ? Date.now() + timeLeft * 1000 : 0,
+      isSynced,
     });
-  }, [isRunning, mode, timeLeft, syncMode]);
+  }, [isRunning, mode, syncMode]);
 
-  // Listen for incoming broadcast timer actions from room
+  // Listen for incoming broadcast timer actions ('timer_sync') from room
   useEffect(() => {
     const unsub = incomingTimerSyncStore.subscribe((payload) => {
       if (!payload || payload.updatedBy === sessionTabId || syncModeStore.get() !== 'synced') return;
 
-      if (payload.isRunning || payload.action === 'START') {
+      const isIncomingRunning = Boolean(payload.isRunning || payload.action === 'START');
+      const targetMode: 'focus' | 'break' = payload.mode || 'focus';
+
+      if (isIncomingRunning) {
         const now = Date.now();
-        const remaining = payload.endTime && payload.endTime > now
-          ? Math.max(0, Math.ceil((payload.endTime - now) / 1000))
-          : payload.remainingSeconds;
-        setMode(payload.mode);
+        const remaining = payload.endTime && Number(payload.endTime) > now
+          ? Math.max(0, Math.ceil((Number(payload.endTime) - now) / 1000))
+          : Math.max(0, payload.remainingSeconds);
+
+        setMode(targetMode);
         setTimeLeft(remaining);
         setIsRunning(true);
         workerRef.current?.postMessage({
           action: 'START',
           payload: { duration: remaining },
         });
-      } else if (payload.action === 'PAUSE' || !payload.isRunning) {
+      } else {
+        const remaining = Math.max(0, payload.remainingSeconds);
         setIsRunning(false);
-        if (payload.mode) setMode(payload.mode);
-        setTimeLeft(payload.remainingSeconds);
-        workerRef.current?.postMessage({ action: 'PAUSE' });
-      } else if (payload.action === 'RESET') {
-        setIsRunning(false);
-        setMode(payload.mode);
-        setTimeLeft(payload.remainingSeconds);
+        setMode(targetMode);
+        setTimeLeft(remaining);
         workerRef.current?.postMessage({
           action: 'RESET',
-          payload: { duration: payload.remainingSeconds },
-        });
-      } else if (payload.action === 'MODE_CHANGE') {
-        setMode(payload.mode);
-        setIsRunning(false);
-        setTimeLeft(payload.remainingSeconds);
-        workerRef.current?.postMessage({
-          action: 'RESET',
-          payload: { duration: payload.remainingSeconds },
+          payload: { duration: remaining },
         });
       }
     });
@@ -282,6 +290,14 @@ export const PomodoroWidget: React.FC = () => {
     setIsRunning(false);
     setTimeLeft(duration);
     broadcastTimerAction('RESET', mode, duration);
+    updateLocalPresence({
+      status: 'Idle',
+      remainingSeconds: duration,
+      endTime: null,
+      isRunning: false,
+      mode,
+      isSynced: syncMode === 'synced',
+    });
   };
 
   const switchMode = (newMode: 'focus' | 'break') => {
@@ -292,6 +308,14 @@ export const PomodoroWidget: React.FC = () => {
     setTimeLeft(duration);
     workerRef.current?.postMessage({ action: 'RESET', payload: { duration } });
     broadcastTimerAction('MODE_CHANGE', newMode, duration);
+    updateLocalPresence({
+      status: 'Idle',
+      remainingSeconds: duration,
+      endTime: null,
+      isRunning: false,
+      mode: newMode,
+      isSynced: syncMode === 'synced',
+    });
   };
 
   const formatTime = (seconds: number) => {
