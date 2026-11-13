@@ -1,0 +1,27 @@
+{
+  "name": "virtualglassdoor",
+  "type": "module",
+  "version": "0.0.1",
+  "engines": {
+    "node": ">=22.23.4"
+  },
+  "scripts": {
+    "astro": "ASTRO_TELEMETRY_DISABLED=1 bun node_modules/astro/bin/astro.mjs",
+    "dev": "ASTRO_TELEMETRY_DISABLED=1 bun node_modules/astro/bin/astro.mjs dev",
+    "build": "ASTRO_TELEMETRY_DISABLED=1 bun node_modules/astro/bin/astro.mjs build",
+    "preview": "ASTRO_TELEMETRY_DISABLED=1 bun node_modules/astro/bin/astro.mjs preview"
+  },
+  "dependencies": {
+    "@astrojs/react": "^7.1.8",
+    "@nanostores/react": "^2.0.1",
+    "@tailwindcss/vite": "^4.3.5",
+    "@types/canvas-confetti": "^1.9.0",
+    "astro": "^7.4.11",
+    "canvas-confetti": "^1.9.4",
+    "lucide-react": "^1.72.0",
+    "nanostores": "^1.5.5",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "tailwindcss": "^4.3.5"
+  }
+}

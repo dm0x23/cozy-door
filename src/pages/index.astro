@@ -1,0 +1,36 @@
+---
+import '../styles/global.css';
+import { OutdoorScenery } from '../components/OutdoorScenery';
+import { BalconyAndDoors } from '../components/BalconyAndDoors';
+import { TasksWidget } from '../components/TasksWidget';
+import { PomodoroWidget } from '../components/PomodoroWidget';
+import { MusicPlayerWidget } from '../components/MusicPlayerWidget';
+import { TopBar } from '../components/TopBar';
+import { SettingsDrawer } from '../components/SettingsDrawer';
+---
+
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+		<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+		<title>Cozy Sliding Glass Doors — Ambient Productivity</title>
+		<meta name="description" content="Ambient productivity app looking out through cozy floor-to-ceiling sliding glass doors onto an outdoor balcony." />
+	</head>
+	<body class="bg-black text-slate-100 overflow-hidden select-none w-screen h-screen relative">
+		<!-- Outdoor Panoramic Scenery Layer (Sky, Sun/Moon, Clouds, Landscape, Weather) -->
+		<OutdoorScenery client:load />
+
+		<!-- Architectural Core: Floor-to-Ceiling Sliding Glass Doors & Balcony Props -->
+		<BalconyAndDoors client:load />
+
+		<!-- Floating Draggable M3 Widgets -->
+		<TasksWidget client:load />
+		<PomodoroWidget client:load />
+		<MusicPlayerWidget client:load />
+
+		<!-- Top Bar & Minimal Settings Drawer -->
+		<TopBar client:load />
+		<SettingsDrawer client:load />
+	</body>
+</html>
