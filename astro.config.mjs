@@ -6,6 +6,7 @@ import tailwindcss from '@tailwindcss/vite';
 export default defineConfig({
   integrations: [react()],
   vite: {
+    envPrefix: ['PUBLIC_', 'SUPABASE_'],
     plugins: [tailwindcss()]
   }
 });

@@ -4,14 +4,26 @@ import {
   pomodoroSettingsStore,
   zenModeStore,
 } from '../stores/appStore';
+import {
+  isConnectedStore,
+  syncModeStore,
+  setSyncMode,
+  broadcastTimerAction,
+  incomingTimerSyncStore,
+  localParticipantId,
+  updateLocalPresence,
+  registerLocalStateSupplier,
+} from '../stores/groupStudyStore';
 import { useDraggable } from '../hooks/useDraggable';
 import { audioEngine } from '../utils/audio';
 import confetti from 'canvas-confetti';
-import { Play, Pause, RotateCcw, GripHorizontal } from 'lucide-react';
+import { Play, Pause, RotateCcw, GripHorizontal, Users } from 'lucide-react';
 
 export const PomodoroWidget: React.FC = () => {
   const zenMode = useStore(zenModeStore);
   const settings = useStore(pomodoroSettingsStore);
+  const isConnected = useStore(isConnectedStore);
+  const syncMode = useStore(syncModeStore);
 
   const [mode, setMode] = useState<'focus' | 'break'>('focus');
   const [isRunning, setIsRunning] = useState(false);
@@ -20,7 +32,7 @@ export const PomodoroWidget: React.FC = () => {
   const workerRef = useRef<Worker | null>(null);
 
   const { position, dragHandleProps } = useDraggable('pomodoro', () => ({
-    x: typeof window !== 'undefined' ? Math.max(16, window.innerWidth / 2 - 130) : 400,
+    x: typeof window !== 'undefined' ? Math.max(16, window.innerWidth / 2 - 140) : 400,
     y: 20,
   }));
 
@@ -39,7 +51,7 @@ export const PomodoroWidget: React.FC = () => {
           if (timerId) clearInterval(timerId);
           timerId = setInterval(() => {
             const now = Date.now();
-            const left = Math.max(0, Math.round((targetTime - now) / 1000));
+            const left = Math.max(0, Math.ceil((targetTime - now) / 1000));
             self.postMessage({ type: 'TICK', timeLeft: left });
             if (left <= 0) {
               clearInterval(timerId);
@@ -51,14 +63,14 @@ export const PomodoroWidget: React.FC = () => {
           if (timerId) clearInterval(timerId);
           timerId = null;
           const now = Date.now();
-          remaining = Math.max(0, Math.round((targetTime - now) / 1000));
+          remaining = Math.max(0, Math.ceil((targetTime - now) / 1000));
           self.postMessage({ type: 'PAUSED', timeLeft: remaining });
         } else if (action === 'RESUME') {
           targetTime = Date.now() + remaining * 1000;
           if (timerId) clearInterval(timerId);
           timerId = setInterval(() => {
             const now = Date.now();
-            const left = Math.max(0, Math.round((targetTime - now) / 1000));
+            const left = Math.max(0, Math.ceil((targetTime - now) / 1000));
             self.postMessage({ type: 'TICK', timeLeft: left });
             if (left <= 0) {
               clearInterval(timerId);
@@ -71,6 +83,17 @@ export const PomodoroWidget: React.FC = () => {
           timerId = null;
           remaining = payload.duration;
           self.postMessage({ type: 'RESET', timeLeft: remaining });
+        } else if (action === 'SYNC') {
+          if (timerId) {
+            const now = Date.now();
+            const left = Math.max(0, Math.ceil((targetTime - now) / 1000));
+            self.postMessage({ type: 'TICK', timeLeft: left });
+            if (left <= 0) {
+              clearInterval(timerId);
+              timerId = null;
+              self.postMessage({ type: 'COMPLETE' });
+            }
+          }
         }
       };
     `;
@@ -112,6 +135,90 @@ export const PomodoroWidget: React.FC = () => {
     }
   }, [settings.focusMinutes, settings.breakMinutes, mode]);
 
+  // Sync timer when returning to tab
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible' && isRunning) {
+        workerRef.current?.postMessage({ action: 'SYNC' });
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [isRunning]);
+
+  // Register local state supplier for late-joiners in study room
+  useEffect(() => {
+    registerLocalStateSupplier(() => {
+      if (!isRunning) return null;
+      return {
+        updatedBy: sessionTabId,
+        action: 'START',
+        isRunning: true,
+        mode,
+        endTime: Date.now() + timeLeft * 1000,
+        remainingSeconds: timeLeft,
+      };
+    });
+  }, [isRunning, mode, timeLeft]);
+
+  // Sync local presence to room members
+  useEffect(() => {
+    updateLocalPresence({
+      status: isRunning ? (mode === 'focus' ? 'Focusing' : 'Break') : 'Idle',
+      remainingSeconds: timeLeft,
+      isSynced: syncMode === 'synced',
+      isRunning,
+      mode,
+      endTime: isRunning ? Date.now() + timeLeft * 1000 : 0,
+    });
+  }, [isRunning, mode, timeLeft, syncMode]);
+
+  // Listen for incoming broadcast timer actions from room
+  useEffect(() => {
+    const unsub = incomingTimerSyncStore.subscribe((payload) => {
+      if (!payload || payload.updatedBy === sessionTabId || syncModeStore.get() !== 'synced') return;
+
+      if (payload.isRunning || payload.action === 'START') {
+        const now = Date.now();
+        const remaining = payload.endTime && payload.endTime > now
+          ? Math.max(0, Math.ceil((payload.endTime - now) / 1000))
+          : payload.remainingSeconds;
+        setMode(payload.mode);
+        setTimeLeft(remaining);
+        setIsRunning(true);
+        workerRef.current?.postMessage({
+          action: 'START',
+          payload: { duration: remaining },
+        });
+      } else if (payload.action === 'PAUSE' || !payload.isRunning) {
+        setIsRunning(false);
+        if (payload.mode) setMode(payload.mode);
+        setTimeLeft(payload.remainingSeconds);
+        workerRef.current?.postMessage({ action: 'PAUSE' });
+      } else if (payload.action === 'RESET') {
+        setIsRunning(false);
+        setMode(payload.mode);
+        setTimeLeft(payload.remainingSeconds);
+        workerRef.current?.postMessage({
+          action: 'RESET',
+          payload: { duration: payload.remainingSeconds },
+        });
+      } else if (payload.action === 'MODE_CHANGE') {
+        setMode(payload.mode);
+        setIsRunning(false);
+        setTimeLeft(payload.remainingSeconds);
+        workerRef.current?.postMessage({
+          action: 'RESET',
+          payload: { duration: payload.remainingSeconds },
+        });
+      }
+    });
+
+    return () => unsub();
+  }, []);
+
   const handleTimerComplete = () => {
     // 1. Play procedural chime
     audioEngine.playChime();
@@ -128,14 +235,19 @@ export const PomodoroWidget: React.FC = () => {
     }
 
     // 3. Native Browser Notification
-    if (typeof window !== 'undefined' && 'Notification' in window) {
-      if (Notification.permission === 'granted') {
-        new Notification('Pomodoro Finished!', {
-          body: mode === 'focus' ? 'Great focus session! Time for a short break.' : 'Break time is over. Ready to focus?',
-        });
-      } else if (Notification.permission !== 'denied') {
-        Notification.requestPermission();
-      }
+    if (typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'granted') {
+      const isFocus = mode === 'focus';
+      const notif = new Notification(
+        isFocus ? 'Focus session complete!' : 'Break is over!',
+        {
+          body: isFocus ? 'Time to take a cozy break.' : 'Ready to jump back into focus?',
+          icon: '/favicon.svg',
+        }
+      );
+      notif.onclick = () => {
+        window.focus();
+        notif.close();
+      };
     }
   };
 
@@ -144,14 +256,23 @@ export const PomodoroWidget: React.FC = () => {
     if (isRunning) {
       workerRef.current?.postMessage({ action: 'PAUSE' });
       setIsRunning(false);
+      broadcastTimerAction('PAUSE', mode, timeLeft);
     } else {
+      // Request notification permission if not yet decided
+      if (typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'default') {
+        Notification.requestPermission().catch(() => {});
+      }
+      const duration = timeLeft <= 0 ? (mode === 'focus' ? settings.focusMinutes : settings.breakMinutes) * 60 : timeLeft;
+      const targetEndTime = Date.now() + duration * 1000;
+
       if (timeLeft <= 0) {
-        const duration = (mode === 'focus' ? settings.focusMinutes : settings.breakMinutes) * 60;
+        setTimeLeft(duration);
         workerRef.current?.postMessage({ action: 'START', payload: { duration } });
       } else {
         workerRef.current?.postMessage({ action: 'RESUME' });
       }
       setIsRunning(true);
+      broadcastTimerAction('START', mode, duration, targetEndTime);
     }
   };
 
@@ -160,6 +281,7 @@ export const PomodoroWidget: React.FC = () => {
     workerRef.current?.postMessage({ action: 'RESET', payload: { duration } });
     setIsRunning(false);
     setTimeLeft(duration);
+    broadcastTimerAction('RESET', mode, duration);
   };
 
   const switchMode = (newMode: 'focus' | 'break') => {
@@ -169,6 +291,7 @@ export const PomodoroWidget: React.FC = () => {
     const duration = (newMode === 'focus' ? settings.focusMinutes : settings.breakMinutes) * 60;
     setTimeLeft(duration);
     workerRef.current?.postMessage({ action: 'RESET', payload: { duration } });
+    broadcastTimerAction('MODE_CHANGE', newMode, duration);
   };
 
   const formatTime = (seconds: number) => {
@@ -238,6 +361,34 @@ export const PomodoroWidget: React.FC = () => {
         >
           <RotateCcw className="w-3.5 h-3.5" />
         </button>
+
+        {/* Synced / Solo Segmented Pill (Visible when connected to a Study Room) */}
+        {isConnected && (
+          <div className="flex bg-[#25272E] p-0.5 rounded-full border border-white/5 text-[10px]">
+            <button
+              onClick={() => setSyncMode('synced')}
+              className={`px-2 py-0.5 rounded-full font-medium transition-all ${
+                syncMode === 'synced'
+                  ? 'bg-[#8EA2FF]/25 text-[#B8C4FF] shadow-sm'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+              title="Synced with Room Timer"
+            >
+              Synced
+            </button>
+            <button
+              onClick={() => setSyncMode('unsynced')}
+              className={`px-2 py-0.5 rounded-full font-medium transition-all ${
+                syncMode === 'unsynced'
+                  ? 'bg-amber-500/20 text-amber-300 shadow-sm'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+              title="Independent Personal Timer"
+            >
+              Solo
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );

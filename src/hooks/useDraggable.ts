@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import { widgetPositionsStore, type WidgetPosition } from '../stores/appStore';
 
 export function useDraggable(
-  widgetKey: 'tasks' | 'pomodoro' | 'music',
+  widgetKey: 'tasks' | 'pomodoro' | 'music' | 'studyRoom',
   defaultPos: () => WidgetPosition
 ) {
   const [position, setPosition] = useState<WidgetPosition>({ x: 0, y: 0 });

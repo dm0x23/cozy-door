@@ -120,11 +120,13 @@ export const widgetPositionsStore = map<{
   tasks: WidgetPosition;
   pomodoro: WidgetPosition;
   music: WidgetPosition;
+  studyRoom: WidgetPosition;
 }>(
   loadFromStorage('vg_widget_positions', {
     tasks: { x: 28, y: 28 },
-    pomodoro: { x: -1, y: 28 }, // -1 means centered horizontally
+    pomodoro: { x: -1, y: 20 }, // -1 means centered horizontally
     music: { x: -1, y: -1 }, // -1 means anchored bottom right
+    studyRoom: { x: -1, y: 20 },
   })
 );
 
@@ -132,11 +134,13 @@ export const widgetMinimizedStore = map<{
   tasks: boolean;
   pomodoro: boolean;
   music: boolean;
+  studyRoom: boolean;
 }>(
   loadFromStorage('vg_widget_minimized', {
     tasks: false,
     pomodoro: false,
     music: false,
+    studyRoom: false,
   })
 );
 
